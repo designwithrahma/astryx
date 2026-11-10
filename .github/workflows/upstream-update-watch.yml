@@ -1,0 +1,84 @@
+# Read-only check of Meta's upstream. Never syncs or merges code.
+# Upstream changes are reported in the Actions run summary.
+# The job intentionally fails when new upstream commits need review.
+name: Astryx Upstream Watch (read-only)
+
+on:
+  schedule:
+    - cron: '27 4 * * 1' # Monday 04:27 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: astryx-upstream-watch
+  cancel-in-progress: false
+
+jobs:
+  check-upstream:
+    if: github.repository == 'designwithrahma/astryx'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Compare local fork with Meta upstream
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const compareUrl = `https://github.com/${owner}/${repo}/compare/${owner}:main...meta:main`;
+            let result;
+            try {
+              const response = await github.request('GET /repos/{owner}/{repo}/compare/{basehead}', {
+                owner,
+                repo,
+                basehead: `${owner}:main...meta:main`,
+                per_page: 100,
+              });
+              result = response.data;
+            } catch (error) {
+              await core.summary
+                .addHeading('Upstream check could not complete', 2)
+                .addRaw('Meta may have deleted, renamed, or rewritten the upstream branch, or the API may be temporarily unavailable. The fork has NOT been changed.\n')
+                .write();
+              core.setFailed(`Review upstream manually: ${error.message}`);
+              return;
+            }
+
+            const ahead = Number(result.ahead_by || 0);
+            const behind = Number(result.behind_by || 0);
+            const files = Array.isArray(result.files) ? result.files : [];
+            const count = (status) => files.filter((file) => file.status === status).length;
+
+            core.summary.addHeading('Astryx upstream comparison', 2);
+            core.summary.addTable([
+              [{ data: 'Measure', header: true }, { data: 'Result', header: true }],
+              ['Upstream new commits', String(ahead)],
+              ['Fork-only commits', String(behind)],
+              ['Files added (listed)', String(count('added'))],
+              ['Files removed (listed)', String(count('removed'))],
+              ['Files modified (listed)', String(count('modified'))],
+              ['Compare status', String(result.status || 'unknown')],
+            ]);
+            core.summary.addRaw(`\n[Inspect changes between fork and upstream](${compareUrl})\n`);
+            if (files.length > 0) {
+              core.summary.addHeading('Changed files (first 40)', 3);
+              core.summary.addTable([
+                [{ data: 'Change', header: true }, { data: 'File', header: true }],
+                ...files.slice(0, 40).map((file) => [
+                  String(file.status || 'unknown'),
+                  String(file.filename || '').replace(/[|\r\n]/g, ' '),
+                ]),
+              ]);
+            }
+            if (files.length >= 300) {
+              core.summary.addRaw('\n**Warning:** GitHub only includes up to 300 changed files in this comparison response. Review the full changes manually.\n');
+            }
+            core.summary.addRaw('\n**Safety:** This workflow never checks out, updates, deletes, merges, or pushes code. No upstream changes are automatically accepted.\n');
+            await core.summary.write();
+
+            if (ahead > 0) {
+              core.setFailed(`Upstream has ${ahead} new commit(s). Review the Actions summary before any manual sync.`);
+            } else {
+              core.info('No new upstream commits were found. Fork remains unchanged.');
+            }
